@@ -1,0 +1,6 @@
+package_name,E
+repo_or_test_path,./test_graph.txt
+mode,test
+version,1.0.0
+max_depth,4
+skip_substring,

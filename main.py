@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Вариант №3 – Этапы 1–3 (русская версия вывода)
+Вариант №3 – Этапы 1–5 (русская версия вывода)
 Простое CLI‑приложение без внешних библиотек:
   • Этап 1: читает конфиг CSV и печатает параметры (ключ=значение)
   • Этап 2: получает прямые зависимости (Alpine APKINDEX или тестовый файл)
   • Этап 3: строит транзитивный граф через итеративный DFS (без рекурсии), с глубиной и обработкой циклов
+  • Этап 4: печатает обратные зависимости (кто зависит от заданного пакета) — тем же DFS
+  • Этап 5: генерирует Mermaid‑диаграмму (текст .mmd) и `graph.html` для просмотра в браузере
 """
 
 import csv
@@ -13,14 +15,11 @@ import sys
 import os
 from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
+import webbrowser
 
 # ---------- Вспомогательные функции ----------
 
 def read_csv_config(path):
-    """
-    Формат CSV: по одной паре key,value на строку
-    Возвращает dict
-    """
     params = {}
     if not os.path.exists(path):
         raise FileNotFoundError(f"Файл конфигурации не найден: {path}")
@@ -37,27 +36,18 @@ def read_csv_config(path):
 
 
 def validate_params(p):
-    required = [
-        "package_name",
-        "repo_or_test_path",
-        "mode",            # 'real' или 'test'
-        "version",         # точная версия для этапа 2 (в режиме real)
-        "max_depth"        # целое неотрицательное
-    ]
+    required = ["package_name","repo_or_test_path","mode","version","max_depth"]
     for k in required:
         if k not in p or p[k] == "":
             raise ValueError(f"Отсутствует обязательный параметр: {k}")
-
-    if p["mode"] not in ("real", "test"):
+    if p["mode"] not in ("real","test"):
         raise ValueError("mode должен быть 'real' или 'test'")
-
     try:
         md = int(p["max_depth"])
         if md < 0:
             raise ValueError
     except ValueError:
         raise ValueError("max_depth должен быть неотрицательным целым числом")
-
     if p["mode"] == "real":
         if not (p["repo_or_test_path"].startswith("http://") or p["repo_or_test_path"].startswith("https://")):
             raise ValueError("В режиме 'real' repo_or_test_path должен быть прямой URL на APKINDEX")
@@ -78,14 +68,6 @@ def download_text(url):
 
 
 def parse_apkindex(text):
-    """
-    Мини‑парсер индекса Alpine APKINDEX.
-    Нас интересуют строки:
-      P:<имя пакета>
-      V:<версия>
-      D:<зависимости> (разделены пробелами/табами; версии отбрасываем)
-    Возвращает: dict имя -> dict версия -> list[str] прямые зависимости
-    """
     db = {}
     current = {}
     for line in text.splitlines():
@@ -110,7 +92,7 @@ def parse_apkindex(text):
             key, val = line.split(":", 1)
             key = key.strip()
             val = val.strip()
-            if key in ("P", "V", "D"):
+            if key in ("P","V","D"):
                 current[key] = val
     if "P" in current and "V" in current:
         name = current.get("P")
@@ -139,15 +121,6 @@ def get_direct_deps_real(apkindex_db, pkg, version):
 
 
 def read_test_graph(path):
-    """
-    Формат тестового файла:
-      NODE:dep1,dep2,dep3
-    Пример:
-      A:B,C
-      B:D
-      C:D,E
-      D:
-    """
     graph = {}
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
@@ -166,17 +139,11 @@ def read_test_graph(path):
 
 
 def build_graph_iterative_dfs(start_pkg, max_depth, neighbors_func):
-    """
-    Итеративный DFS без рекурсии (через стек).
-    neighbors_func(node) -> список зависимостей
-    Учитывает max_depth, обрабатывает циклы.
-    Возвращает (adjacency, order)
-    """
     adj = {}
     visited = set()
     in_stack = set()
     order = []
-    stack = [(start_pkg, 0, 0)]  # (узел, глубина, 0=pre 1=post)
+    stack = [(start_pkg, 0, 0)]
 
     while stack:
         node, depth, state = stack.pop()
@@ -184,11 +151,9 @@ def build_graph_iterative_dfs(start_pkg, max_depth, neighbors_func):
             if node in visited:
                 continue
             if node in in_stack:
-                # цикл — не разворачиваем дальше
                 continue
             in_stack.add(node)
             order.append(node)
-
             stack.append((node, depth, 1))
 
             try:
@@ -207,6 +172,60 @@ def build_graph_iterative_dfs(start_pkg, max_depth, neighbors_func):
     return adj, order
 
 
+def make_filtered_neighbors(base_neighbors, skip_substring):
+    if not skip_substring:
+        return base_neighbors
+    def wrapper(node):
+        return [nb for nb in base_neighbors(node) if skip_substring not in nb]
+    return wrapper
+
+
+# ---------- Mermaid ----------
+
+def mermaid_from_adj(adj):
+    lines = ["graph TD"]
+    seen_edges = set()
+    for src, deps in adj.items():
+        if not deps:
+            lines.append(f"    {src}")
+        for dst in deps:
+            e = (src, dst)
+            if e in seen_edges:
+                continue
+            seen_edges.add(e)
+            lines.append(f"    {src} --> {dst}")
+    return "\n".join(lines)
+
+
+def write_mermaid_files(adj, out_dir="."):
+    mmd = mermaid_from_adj(adj)
+    mmd_path = os.path.join(out_dir, "graph.mmd")
+    with open(mmd_path, "w", encoding="utf-8") as f:
+        f.write(mmd)
+
+    html = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Граф зависимостей</title>
+</head>
+<body>
+  <pre class="mermaid">
+{mmd}
+  </pre>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({{ startOnLoad: true }});
+  </script>
+</body>
+</html>
+"""
+    html_path = os.path.join(out_dir, "graph.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return mmd_path, html_path
+
+
 # ---------- CLI‑поток ----------
 
 def stage1_print_params(p):
@@ -223,7 +242,7 @@ def stage2_get_direct_deps(p):
         graph = read_test_graph(p["repo_or_test_path"])
         deps = graph.get(pkg, [])
         print(f"{pkg}: {', '.join(deps) if deps else '(нет прямых зависимостей)'}")
-        return lambda n: graph.get(n, [])
+        return make_filtered_neighbors(lambda n: graph.get(n, []), p.get("skip_substring",""))
     else:
         apk_text = download_text(p["repo_or_test_path"])
         db = parse_apkindex(apk_text)
@@ -236,9 +255,9 @@ def stage2_get_direct_deps(p):
             versions = db.get(n, {})
             if not versions:
                 raise KeyError(f"Пакет не найден в APKINDEX: {n}")
-            ver = sorted(versions.keys())[-1]  # простейший выбор версии
+            ver = sorted(versions.keys())[-1]
             return versions[ver]
-        return neigh
+        return make_filtered_neighbors(neigh, p.get("skip_substring",""))
 
 
 def stage3_build_graph(p, neighbors_func):
@@ -252,9 +271,48 @@ def stage3_build_graph(p, neighbors_func):
     for node in adj:
         deps = adj[node]
         print(f"  {node} -> {', '.join(deps) if deps else '∅'}")
+    return adj
 
+
+def stage4_reverse_dependencies(p, forward_adj):
+    print("\n=== Этап 4: Обратные зависимости (кто зависит от пакета) ===")
+    # строим обратную смежность
+    rev = {}
+    for src, deps in forward_adj.items():
+        rev.setdefault(src, [])
+        for d in deps:
+            rev.setdefault(d, [])
+            if src not in rev[d]:
+                rev[d].append(src)
+
+    start = p["package_name"]
+    max_depth = int(p["max_depth"])
+
+    def rev_neighbors(n):
+        return rev.get(n, [])
+
+    rev_adj, order = build_graph_iterative_dfs(start, max_depth, rev_neighbors)
+
+    print(f"Порядок обхода (обратный): {', '.join(order)}")
+    print("Обратная смежность (зависящие):")
+    for node in rev_adj:
+        deps = rev_adj[node]
+        print(f"  {node} <- {', '.join(deps) if deps else '∅'}")
+    return rev_adj
+
+
+def stage5_visualize(adj):
+    print("=== Этап 5: Визуализация (Mermaid) ===")
+    mmd_path, html_path = write_mermaid_files(adj, out_dir=".")
+    print(f"Mermaid-текст сохранён в: {mmd_path}")
+    print(f"Откройте в браузере: {html_path}")
+    try:
+        webbrowser.open(os.path.abspath(html_path))
+    except Exception:
+        pass
 
 def main():
+
     if len(sys.argv) < 2:
         print("Использование: python main.py путь/к/config.csv")
         sys.exit(1)
@@ -264,7 +322,11 @@ def main():
         validate_params(params)
         stage1_print_params(params)               # Этап 1
         neigh = stage2_get_direct_deps(params)    # Этап 2
-        stage3_build_graph(params, neigh)         # Этап 3
+        adj = stage3_build_graph(params, neigh)   # Этап 3
+        rev = stage4_reverse_dependencies(params, adj)  # Этап 4
+        vis_mode = params.get("visualize_mode","forward").lower()
+        to_draw = adj if vis_mode != "reverse" else rev
+        stage5_visualize(to_draw)                     # Этап 5
     except Exception as e:
         print(f"[ОШИБКА] {e}", file=sys.stderr)
         sys.exit(2)
