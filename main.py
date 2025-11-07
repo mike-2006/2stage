@@ -13,7 +13,7 @@ import sys
 import os
 from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
-
+import io, tarfile, gzip
 # ---------- Вспомогательные функции ----------
 
 def read_csv_config(path):
@@ -61,7 +61,7 @@ def validate_params(p):
     if p["mode"] == "real":
         if not (p["repo_or_test_path"].startswith("http://") or p["repo_or_test_path"].startswith("https://")):
             raise ValueError("В режиме 'real' repo_or_test_path должен быть прямой URL на APKINDEX")
-        if not p["repo_or_test_path"].lower().endswith("apkindex"):
+        if not (p["repo_or_test_path"].lower().endswith("apkindex") or p["repo_or_test_path"].lower().endswith("apkindex.tar.gz")):
             print("[ПРЕДУПРЕЖДЕНИЕ] URL не оканчивается на 'APKINDEX' — проверьте правильность.", file=sys.stderr)
     else:
         if not os.path.exists(p["repo_or_test_path"]):
@@ -70,11 +70,30 @@ def validate_params(p):
 
 def download_text(url):
     try:
-        with urlopen(url, timeout=20) as resp:
+        with urlopen(url, timeout=30) as resp:
             data = resp.read()
-        return data.decode('utf-8', errors='replace')
     except (URLError, HTTPError) as e:
         raise RuntimeError(f"Ошибка сети при загрузке {url}: {e}")
+
+    low = url.lower()
+    if low.endswith(".tar.gz"):
+        # распакуем tar.gz и вытащим файл APKINDEX
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            member = next((m for m in tf.getmembers() if m.name.endswith("APKINDEX")), None)
+            if not member:
+                raise RuntimeError("В APKINDEX.tar.gz файл APKINDEX не найден")
+            with tf.extractfile(member) as f:
+                return f.read().decode("utf-8", errors="replace")
+    else:
+        # попытка расценить как уже текстовый APKINDEX
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            # некоторые зеркала отдают просто gzip без tar
+            try:
+                return gzip.decompress(data).decode("utf-8", errors="replace")
+            except Exception:
+                raise RuntimeError("Не удалось распаковать APKINDEX: формат не распознан")
 
 
 def parse_apkindex(text):
