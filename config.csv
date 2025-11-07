@@ -1,4 +1,4 @@
-package_name,myapp
+package_name,A
 repo_or_test_path,./test_graph.txt
 mode,test
 version,1.0.0

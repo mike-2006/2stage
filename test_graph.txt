@@ -1,4 +1,4 @@
-# Simple test repo (packages are capital letters)
+# Тестовый граф (пакеты обозначены заглавными латинскими буквами)
 A:B,C
 B:D
 C:D,E
