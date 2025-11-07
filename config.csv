@@ -1,0 +1,5 @@
+package_name,myapp
+repo_or_test_path,./test_graph.txt
+mode,test
+version,1.0.0
+max_depth,3
