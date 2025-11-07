@@ -207,6 +207,14 @@ def build_graph_iterative_dfs(start_pkg, max_depth, neighbors_func):
     return adj, order
 
 
+def make_filtered_neighbors(base_neighbors, skip_substring):
+    if not skip_substring:
+        return base_neighbors
+    def wrapper(node):
+        return [nb for nb in base_neighbors(node) if skip_substring not in nb]
+    return wrapper
+
+
 # ---------- CLI‑поток ----------
 
 def stage1_print_params(p):
@@ -223,7 +231,7 @@ def stage2_get_direct_deps(p):
         graph = read_test_graph(p["repo_or_test_path"])
         deps = graph.get(pkg, [])
         print(f"{pkg}: {', '.join(deps) if deps else '(нет прямых зависимостей)'}")
-        return lambda n: graph.get(n, [])
+        return make_filtered_neighbors(lambda n: graph.get(n, []), p.get("skip_substring",""))
     else:
         apk_text = download_text(p["repo_or_test_path"])
         db = parse_apkindex(apk_text)
@@ -238,7 +246,7 @@ def stage2_get_direct_deps(p):
                 raise KeyError(f"Пакет не найден в APKINDEX: {n}")
             ver = sorted(versions.keys())[-1]  # простейший выбор версии
             return versions[ver]
-        return neigh
+        return make_filtered_neighbors(neigh, p.get("skip_substring",""))
 
 
 def stage3_build_graph(p, neighbors_func):
