@@ -1,0 +1,8 @@
+# Шаблон для запуска на реальном APKINDEX (заполни package_name и version верно)
+package_name,alpine-baselayout
+repo_or_test_path,https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz
+mode,real
+version,3.6.5-r0
+max_depth,2
+skip_substring,
+visualize_mode,forward
