@@ -6,13 +6,13 @@ import sys
 import os
 from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
+import math
 
 # =========================
 # Этап 1. ЧТЕНИЕ КОНФИГА
 # =========================
 
 def read_config(path):
-    """Читаем config.csv в словарь key -> value."""
     if not os.path.exists(path):
         print(f"[ОШИБКА] Файл конфигурации не найден: {path}")
         sys.exit(1)
@@ -62,6 +62,9 @@ def validate_config(params):
 
 def print_params(params):
     """Этап 1: выводим параметры key=value."""
+
+
+def print_params(params):
     print("=== Этап 1: Параметры (ключ=значение) ===")
     for key, value in params.items():
         print(f"{key}={value}")
@@ -130,6 +133,10 @@ def parse_apkindex(text):
     Возвращаем словарь:
       packages[name][version] = список_зависимостей
     """
+
+
+
+def parse_apkindex(text):
     packages = {}
     current_name = None
     current_version = None
@@ -138,7 +145,6 @@ def parse_apkindex(text):
     for line in text.splitlines():
         line = line.strip()
         if line == "":
-            # конец записи
             if current_name is not None and current_version is not None:
                 if current_name not in packages:
                     packages[current_name] = {}
@@ -157,13 +163,11 @@ def parse_apkindex(text):
             if deps_line == "":
                 current_deps = []
             else:
-                # разделяем по пробелам и убираем версии / so:
                 parts = deps_line.replace(",", " ").split()
                 deps = []
                 for item in parts:
                     if item.startswith("so:"):
                         continue
-                    # отбрасываем всё после знаков сравнения и '='
                     cut = item.split("<")[0]
                     cut = cut.split(">")[0]
                     cut = cut.split("=")[0]
@@ -172,7 +176,6 @@ def parse_apkindex(text):
                         deps.append(dep_name)
                 current_deps = deps
 
-    # на случай, если запись не завершилась пустой строкой
     if current_name is not None and current_version is not None:
         if current_name not in packages:
             packages[current_name] = {}
@@ -182,14 +185,6 @@ def parse_apkindex(text):
 
 
 def read_test_graph(path):
-    """
-    Формат файла test_graph.txt:
-      A:B,C
-      B:D
-      C:D,E
-      D:
-    Возвращаем dict: имя -> список зависимостей
-    """
     graph = {}
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
@@ -210,31 +205,20 @@ def read_test_graph(path):
 
 
 def build_package_deps_real(packages, root_name, root_version):
-    """
-    Преобразуем структуру packages[name][version] в
-    более простой словарь: deps[name] = список зависимостей.
-    Для корневого пакета используем именно root_version (если нет — ошибка).
-    Для остальных пакетов берём "какую-нибудь" версию (максимальную по строке).
-    """
     if root_name not in packages:
         print(f"[ОШИБКА] Пакет {root_name} не найден в APKINDEX")
         sys.exit(1)
-
-    versions = packages[root_name]
-    if root_version not in versions:
+    if root_version not in packages[root_name]:
         print(f"[ОШИБКА] У пакета {root_name} нет версии {root_version}")
-        print("Доступные версии:", ", ".join(versions.keys()))
+        print("Доступные версии:", ", ".join(packages[root_name].keys()))
         sys.exit(1)
 
     deps = {}
-    # сначала корневой пакет
-    deps[root_name] = versions[root_version]
+    deps[root_name] = packages[root_name][root_version]
 
-    # остальные пакеты
     for name, ver_map in packages.items():
         if name == root_name:
             continue
-        # берём "максимальную" версию по строке
         all_versions = sorted(ver_map.keys())
         chosen_version = all_versions[-1]
         deps[name] = ver_map[chosen_version]
@@ -243,21 +227,19 @@ def build_package_deps_real(packages, root_name, root_version):
 
 
 def stage2_get_direct_deps(params):
-    """Этап 2: печатаем прямые зависимости и возвращаем словарь deps[name] = [..]."""
     print("=== Этап 2: Прямые зависимости ===")
     mode = params["mode"]
     root = params["package_name"]
 
     if mode == "test":
         graph = read_test_graph(params["repo_or_test_path"])
-        if root in graph:
-            direct = graph[root]
+        direct = graph.get(root, [])
+        if direct:
+            print(f"{root}: {', '.join(direct)}")
         else:
-            direct = []
-        print(f"{root}: {', '.join(direct) if direct else '(нет прямых зависимостей)'}")
+            print(f"{root}: (нет прямых зависимостей)")
         return graph
 
-    # mode == real
     url = params["repo_or_test_path"]
     text = load_text_from_url(url)
     packages = parse_apkindex(text)
@@ -272,59 +254,175 @@ def stage2_get_direct_deps(params):
 
 
 # =========================
-# Этап 3. ГРАФ (DFS БЕЗ РЕКУРСИИ)
+# Этап 3. ГРАФ ЗАВИСИМОСТЕЙ
 # =========================
 
-def stage3_build_graph(params, deps):
-    """Этап 3: итеративный обход в глубину и построение списка смежности."""
-    print("\n=== Этап 3: Полный граф зависимостей (итеративный DFS) ===")
-
+def build_forward_graph(params, deps):
+    print("\n=== Этап 3: Полный граф (итеративный DFS) ===")
     start = params["package_name"]
     max_depth = int(params["max_depth"])
     skip_substring = params.get("skip_substring", "")
 
-    adjacency = {}       # node -> list of neighbours
-    visited = set()      # уже полностью обработанные узлы
-    stack = []           # стек для DFS: элементы (имя_пакета, текущая_глубина)
-
-    stack.append((start, 0))
+    adjacency = {}
+    visited = set()
+    stack = [(start, 0)]
 
     while stack:
         current, depth = stack.pop()
         if current in visited:
             continue
 
-        # фильтр по подстроке (если задан)
         if skip_substring != "" and skip_substring in current:
-            # просто не разворачиваем такой узел
             visited.add(current)
             continue
 
         visited.add(current)
-
-        # получаем список соседей
         neighbors = deps.get(current, [])
         adjacency[current] = neighbors
 
-        # если достигли максимальной глубины, дальше не идём
         if depth >= max_depth:
             continue
 
-        # добавляем соседей в стек
         for name in neighbors:
             if name not in visited:
                 stack.append((name, depth + 1))
 
-    # вывод результата
-    print("Список смежности:")
+    print("Список смежности (прямой граф):")
     for name in adjacency:
         neigh = adjacency[name]
-        if len(neigh) == 0:
-            line = "∅"
-        else:
-            line = ", ".join(neigh)
+        line = ", ".join(neigh) if neigh else "∅"
         print(f"  {name} -> {line}")
 
+    return adjacency
+
+
+# =========================
+# Этап 4. ОБРАТНЫЕ ЗАВИСИМОСТИ
+# =========================
+
+def build_reverse_graph(params, forward_adj):
+    print("\n=== Этап 4: Обратные зависимости (кто зависит от пакета) ===")
+
+    # строим обратное отображение
+    reverse_adj = {}
+    for src in forward_adj:
+        if src not in reverse_adj:
+            reverse_adj[src] = []
+        for dst in forward_adj[src]:
+            if dst not in reverse_adj:
+                reverse_adj[dst] = []
+            if src not in reverse_adj[dst]:
+                reverse_adj[dst].append(src)
+
+    start = params["package_name"]
+    max_depth = int(params["max_depth"])
+    skip_substring = params.get("skip_substring", "")
+
+    result_adj = {}
+    visited = set()
+    stack = [(start, 0)]
+
+    while stack:
+        current, depth = stack.pop()
+        if current in visited:
+            continue
+
+        if skip_substring != "" and skip_substring in current:
+            visited.add(current)
+            continue
+
+        visited.add(current)
+        neighbors = reverse_adj.get(current, [])
+        result_adj[current] = neighbors
+
+        if depth >= max_depth:
+            continue
+
+        for name in neighbors:
+            if name not in visited:
+                stack.append((name, depth + 1))
+
+    print("Список смежности (обратный граф):")
+    for name in result_adj:
+        neigh = result_adj[name]
+        line = ", ".join(neigh) if neigh else "∅"
+        print(f"  {name} <- {line}")
+
+    return result_adj
+
+
+# =========================
+# Этап 5. КАРТИНКА ГРАФА (PNG)
+# =========================
+
+def draw_graph_png(adjacency, filename):
+    """
+    Рисуем простой граф зависимостей:
+    каждый пакет в отдельной строке (по вертикали),
+    зависимости стрелками вниз.
+    Подходит для цепочек и небольших графов.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[ПРЕДУПРЕЖДЕНИЕ] matplotlib не установлен, картинка не будет создана")
+        return
+
+    # Собираем список всех узлов (и ключи, и их зависимости)
+    nodes = []
+    for src in adjacency:
+        if src not in nodes:
+            nodes.append(src)
+        for dst in adjacency[src]:
+            if dst not in nodes:
+                nodes.append(dst)
+
+    if not nodes:
+        print("[ПРЕДУПРЕЖДЕНИЕ] Пустой граф, нечего рисовать")
+        return
+
+    # Располагаем узлы по вертикали: x = 0, y = -i
+    positions = {}
+    for i, name in enumerate(nodes):
+        x = 0.0
+        y = -i
+        positions[name] = (x, y)
+
+    # Готовим рисунок
+    fig, ax = plt.subplots(figsize=(4, max(3, len(nodes))))  # высота зависит от числа узлов
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    # Рёбра (просто стрелки вниз)
+    for src in adjacency:
+        x1, y1 = positions[src]
+        for dst in adjacency[src]:
+            x2, y2 = positions.get(dst, (0.0, 0.0))
+            ax.annotate(
+                "", xy=(x2, y2 + 0.2), xytext=(x1, y1 - 0.2),
+                arrowprops=dict(arrowstyle="->", linewidth=1)
+            )
+
+    # Узлы (точки + подписи)
+    for name in nodes:
+        x, y = positions[name]
+        ax.scatter([x], [y], s=50)
+        ax.text(
+            x, y, name,
+            fontsize=10,
+            ha="center", va="center",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="black", lw=0.5)
+        )
+
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150)
+    plt.close(fig)
+    print(f"Картинка графа сохранена в файл: {filename}")
+
+
+# =========================
+# MAIN
+# =========================
 
 def main():
     if len(sys.argv) < 2:
@@ -334,10 +432,19 @@ def main():
     config_path = sys.argv[1]
     params = read_config(config_path)
     validate_config(params)
-    print_params(params)               # Этап 1
-    deps = stage2_get_direct_deps(params)  # Этап 2
-    stage3_build_graph(params, deps)   # Этап 3
+    print_params(params)                    # Этап 1
+
+    deps = stage2_get_direct_deps(params)   # Этап 2
+    forward_adj = build_forward_graph(params, deps)   # Этап 3
+    reverse_adj = build_reverse_graph(params, forward_adj)  # Этап 4
+
+    # Этап 5: картинка. Можно выбрать, что рисовать: прямой или обратный граф.
+    # Для примера рисуем прямой граф:
+    draw_graph_png(forward_adj, "graph_forward.png")
+    # И, при желании, обратный:
+    draw_graph_png(reverse_adj, "graph_reverse.png")
 
 
 if __name__ == "__main__":
     main()
+# End of main.py
