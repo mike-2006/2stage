@@ -1,7 +1,0 @@
-# Simple test repo (packages are capital letters)
-A:B,C
-B:D
-C:D,E
-D:
-E:F
-F:
