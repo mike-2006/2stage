@@ -1,300 +1,342 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Вариант №3 – Этапы 1–3 (русская версия вывода)
-Простое CLI‑приложение без внешних библиотек:
-  • Этап 1: читает конфиг CSV и печатает параметры (ключ=значение)
-  • Этап 2: получает прямые зависимости (Alpine APKINDEX или тестовый файл)
-  • Этап 3: строит транзитивный граф через итеративный DFS (без рекурсии), с глубиной и обработкой циклов
-"""
 
 import csv
 import sys
 import os
 from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
-import io, tarfile, gzip
-# ---------- Вспомогательные функции ----------
 
-def read_csv_config(path):
-    """
-    Формат CSV: по одной паре key,value на строку
-    Возвращает dict
-    """
-    params = {}
+# =========================
+# Этап 1. ЧТЕНИЕ КОНФИГА
+# =========================
+
+def read_config(path):
+    """Читаем config.csv в словарь key -> value."""
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Файл конфигурации не найден: {path}")
-    with open(path, 'r', encoding='utf-8') as f:
+        print(f"[ОШИБКА] Файл конфигурации не найден: {path}")
+        sys.exit(1)
+
+    params = {}
+    with open(path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         for row in reader:
-            if not row or len(row) < 2:
+            if len(row) < 2:
                 continue
             key = row[0].strip()
             value = row[1].strip()
-            if key:
+            if key != "":
                 params[key] = value
     return params
 
 
-def validate_params(p):
-    required = [
-        "package_name",
-        "repo_or_test_path",
-        "mode",            # 'real' или 'test'
-        "version",         # точная версия для этапа 2 (в режиме real)
-        "max_depth"        # целое неотрицательное
-    ]
-    for k in required:
-        if k not in p or p[k] == "":
-            raise ValueError(f"Отсутствует обязательный параметр: {k}")
+def validate_config(params):
+    """Проверяем обязательные параметры и режим."""
+    required = ["package_name", "repo_or_test_path", "mode", "version", "max_depth"]
+    for name in required:
+        if name not in params or params[name] == "":
+            print(f"[ОШИБКА] Нет обязательного параметра: {name}")
+            sys.exit(1)
 
-    if p["mode"] not in ("real", "test"):
-        raise ValueError("mode должен быть 'real' или 'test'")
+    mode = params["mode"]
+    if mode not in ("test", "real"):
+        print("[ОШИБКА] mode должен быть 'test' или 'real'")
+        sys.exit(1)
 
+    # max_depth должно быть целым неотрицательным
     try:
-        md = int(p["max_depth"])
-        if md < 0:
-            raise ValueError
+        depth = int(params["max_depth"])
+        if depth < 0:
+            raise ValueError()
     except ValueError:
-        raise ValueError("max_depth должен быть неотрицательным целым числом")
+        print("[ОШИБКА] max_depth должно быть неотрицательным целым числом")
+        sys.exit(1)
 
-    if p["mode"] == "real":
-        if not (p["repo_or_test_path"].startswith("http://") or p["repo_or_test_path"].startswith("https://")):
-            raise ValueError("В режиме 'real' repo_or_test_path должен быть прямой URL на APKINDEX")
-        if not (p["repo_or_test_path"].lower().endswith("apkindex") or p["repo_or_test_path"].lower().endswith("apkindex.tar.gz")):
-            print("[ПРЕДУПРЕЖДЕНИЕ] URL не оканчивается на 'APKINDEX' — проверьте правильность.", file=sys.stderr)
-    else:
-        if not os.path.exists(p["repo_or_test_path"]):
-            raise FileNotFoundError(f"Файл тестового графа не найден: {p['repo_or_test_path']}")
+    if mode == "test":
+        path = params["repo_or_test_path"]
+        if not os.path.exists(path):
+            print(f"[ОШИБКА] Файл тестового графа не найден: {path}")
+            sys.exit(1)
+    # В режиме real просто считаем, что URL корректный, проверка будет при загрузке
 
 
-def download_text(url):
+def print_params(params):
+    """Этап 1: выводим параметры key=value."""
+    print("=== Этап 1: Параметры (ключ=значение) ===")
+    for key, value in params.items():
+        print(f"{key}={value}")
+    print()
+
+
+# =========================
+# Этап 2. ПРЯМЫЕ ЗАВИСИМОСТИ
+# =========================
+
+def load_text_from_url(url):
+    """
+    Простой загрузчик, который поддерживает:
+    - APKINDEX.tar.gz (нужно распаковать)
+    - APKINDEX (обычный текст)
+    """
+    import gzip
+    import tarfile
+    import io
+
     try:
-        with urlopen(url, timeout=30) as resp:
+        with urlopen(url, timeout=20) as resp:
             data = resp.read()
-    except (URLError, HTTPError) as e:
-        raise RuntimeError(f"Ошибка сети при загрузке {url}: {e}")
+    except Exception as e:
+        print(f"[ОШИБКА] не удалось загрузить {url}: {e}")
+        sys.exit(1)
 
-    low = url.lower()
-    if low.endswith(".tar.gz"):
-        # распакуем tar.gz и вытащим файл APKINDEX
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-            member = next((m for m in tf.getmembers() if m.name.endswith("APKINDEX")), None)
-            if not member:
-                raise RuntimeError("В APKINDEX.tar.gz файл APKINDEX не найден")
-            with tf.extractfile(member) as f:
-                return f.read().decode("utf-8", errors="replace")
-    else:
-        # попытка расценить как уже текстовый APKINDEX
+    url_low = url.lower()
+
+    # ----- если это tar.gz -----
+    if url_low.endswith(".tar.gz"):
         try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            # некоторые зеркала отдают просто gzip без tar
-            try:
-                return gzip.decompress(data).decode("utf-8", errors="replace")
-            except Exception:
-                raise RuntimeError("Не удалось распаковать APKINDEX: формат не распознан")
+            bio = io.BytesIO(data)
+            with tarfile.open(fileobj=bio, mode="r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name.endswith("APKINDEX"):
+                        f = tar.extractfile(member)
+                        text = f.read().decode("utf-8", errors="replace")
+                        return text
+            print("[ОШИБКА] В APKINDEX.tar.gz не найден файл APKINDEX")
+            sys.exit(1)
+        except Exception as e:
+            print(f"[ОШИБКА] ошибка при распаковке tar.gz: {e}")
+            sys.exit(1)
+
+    # ----- если это обычный APKINDEX -----
+    try:
+        return data.decode("utf-8", errors="replace")
+    except:
+        # может быть gzip без tar
+        try:
+            decoded = gzip.decompress(data).decode("utf-8", errors="replace")
+            return decoded
+        except:
+            print("[ОШИБКА] Невозможно прочитать APKINDEX")
+            sys.exit(1)
 
 
 def parse_apkindex(text):
     """
-    Мини‑парсер индекса Alpine APKINDEX.
-    Нас интересуют строки:
-      P:<имя пакета>
-      V:<версия>
-      D:<зависимости> (разделены пробелами/табами; версии отбрасываем)
-    Возвращает: dict имя -> dict версия -> list[str] прямые зависимости
+    Простой парсер APKINDEX.
+    Нас интересуют только:
+    P:имя
+    V:версия
+    D:зависимости (строка)
+    Возвращаем словарь:
+      packages[name][version] = список_зависимостей
     """
-    db = {}
-    current = {}
+    packages = {}
+    current_name = None
+    current_version = None
+    current_deps = []
+
     for line in text.splitlines():
-        if not line.strip():
-            if "P" in current and "V" in current:
-                name = current.get("P")
-                ver = current.get("V")
-                deps_line = current.get("D", "")
-                deps = []
-                if deps_line:
-                    raw = deps_line.replace(",", " ").split()
-                    for token in raw:
-                        if token.startswith("so:"):
-                            continue
-                        dep = token.split("<")[0].split(">")[0].split("=")[0].strip()
-                        if dep:
-                            deps.append(dep)
-                db.setdefault(name, {}).setdefault(ver, deps)
-            current = {}
+        line = line.strip()
+        if line == "":
+            # конец записи
+            if current_name is not None and current_version is not None:
+                if current_name not in packages:
+                    packages[current_name] = {}
+                packages[current_name][current_version] = current_deps
+            current_name = None
+            current_version = None
+            current_deps = []
             continue
-        if ":" in line:
-            key, val = line.split(":", 1)
-            key = key.strip()
-            val = val.strip()
-            if key in ("P", "V", "D"):
-                current[key] = val
-    if "P" in current and "V" in current:
-        name = current.get("P")
-        ver = current.get("V")
-        deps_line = current.get("D", "")
-        deps = []
-        if deps_line:
-            raw = deps_line.replace(",", " ").split()
-            for token in raw:
-                if token.startswith("so:"):
-                    continue
-                dep = token.split("<")[0].split(">")[0].split("=")[0].strip()
-                if dep:
-                    deps.append(dep)
-        db.setdefault(name, {}).setdefault(ver, deps)
-    return db
 
+        if line.startswith("P:"):
+            current_name = line[2:].strip()
+        elif line.startswith("V:"):
+            current_version = line[2:].strip()
+        elif line.startswith("D:"):
+            deps_line = line[2:].strip()
+            if deps_line == "":
+                current_deps = []
+            else:
+                # разделяем по пробелам и убираем версии / so:
+                parts = deps_line.replace(",", " ").split()
+                deps = []
+                for item in parts:
+                    if item.startswith("so:"):
+                        continue
+                    # отбрасываем всё после знаков сравнения и '='
+                    cut = item.split("<")[0]
+                    cut = cut.split(">")[0]
+                    cut = cut.split("=")[0]
+                    dep_name = cut.strip()
+                    if dep_name != "":
+                        deps.append(dep_name)
+                current_deps = deps
 
-def get_direct_deps_real(apkindex_db, pkg, version):
-    versions = apkindex_db.get(pkg, {})
-    if not versions:
-        raise KeyError(f"Пакет не найден в APKINDEX: {pkg}")
-    if version not in versions:
-        raise KeyError(f"Точная версия не найдена для {pkg}. Ожидалась: {version}. Доступны: {', '.join(versions.keys())}")
-    return versions[version]
+    # на случай, если запись не завершилась пустой строкой
+    if current_name is not None and current_version is not None:
+        if current_name not in packages:
+            packages[current_name] = {}
+        packages[current_name][current_version] = current_deps
+
+    return packages
 
 
 def read_test_graph(path):
     """
-    Формат тестового файла:
-      NODE:dep1,dep2,dep3
-    Пример:
+    Формат файла test_graph.txt:
       A:B,C
       B:D
       C:D,E
       D:
+    Возвращаем dict: имя -> список зависимостей
     """
     graph = {}
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
-            if not line or line.startswith("#"):
+            if line == "" or line.startswith("#"):
                 continue
-            if ":" not in line:
-                node = line
-                graph.setdefault(node, [])
-                continue
-            node, rest = line.split(":", 1)
-            node = node.strip()
-            deps = [d.strip() for d in rest.split(",") if d.strip()] if rest.strip() else []
-            graph[node] = deps
+            if ":" in line:
+                name, deps_str = line.split(":", 1)
+                name = name.strip()
+                if deps_str.strip() == "":
+                    deps = []
+                else:
+                    deps = [x.strip() for x in deps_str.split(",") if x.strip() != ""]
+                graph[name] = deps
+            else:
+                graph[line] = []
     return graph
 
 
-def build_graph_iterative_dfs(start_pkg, max_depth, neighbors_func):
+def build_package_deps_real(packages, root_name, root_version):
     """
-    Итеративный DFS без рекурсии (через стек).
-    neighbors_func(node) -> список зависимостей
-    Учитывает max_depth, обрабатывает циклы.
-    Возвращает (adjacency, order)
+    Преобразуем структуру packages[name][version] в
+    более простой словарь: deps[name] = список зависимостей.
+    Для корневого пакета используем именно root_version (если нет — ошибка).
+    Для остальных пакетов берём "какую-нибудь" версию (максимальную по строке).
     """
-    adj = {}
-    visited = set()
-    in_stack = set()
-    order = []
-    stack = [(start_pkg, 0, 0)]  # (узел, глубина, 0=pre 1=post)
+    if root_name not in packages:
+        print(f"[ОШИБКА] Пакет {root_name} не найден в APKINDEX")
+        sys.exit(1)
+
+    versions = packages[root_name]
+    if root_version not in versions:
+        print(f"[ОШИБКА] У пакета {root_name} нет версии {root_version}")
+        print("Доступные версии:", ", ".join(versions.keys()))
+        sys.exit(1)
+
+    deps = {}
+    # сначала корневой пакет
+    deps[root_name] = versions[root_version]
+
+    # остальные пакеты
+    for name, ver_map in packages.items():
+        if name == root_name:
+            continue
+        # берём "максимальную" версию по строке
+        all_versions = sorted(ver_map.keys())
+        chosen_version = all_versions[-1]
+        deps[name] = ver_map[chosen_version]
+
+    return deps
+
+
+def stage2_get_direct_deps(params):
+    """Этап 2: печатаем прямые зависимости и возвращаем словарь deps[name] = [..]."""
+    print("=== Этап 2: Прямые зависимости ===")
+    mode = params["mode"]
+    root = params["package_name"]
+
+    if mode == "test":
+        graph = read_test_graph(params["repo_or_test_path"])
+        if root in graph:
+            direct = graph[root]
+        else:
+            direct = []
+        print(f"{root}: {', '.join(direct) if direct else '(нет прямых зависимостей)'}")
+        return graph
+
+    # mode == real
+    url = params["repo_or_test_path"]
+    text = load_text_from_url(url)
+    packages = parse_apkindex(text)
+    root_version = params["version"]
+    deps = build_package_deps_real(packages, root, root_version)
+    direct = deps.get(root, [])
+    if direct:
+        print(f"{root} ({root_version}): {', '.join(direct)}")
+    else:
+        print(f"{root} ({root_version}): (нет прямых зависимостей)")
+    return deps
+
+
+# =========================
+# Этап 3. ГРАФ (DFS БЕЗ РЕКУРСИИ)
+# =========================
+
+def stage3_build_graph(params, deps):
+    """Этап 3: итеративный обход в глубину и построение списка смежности."""
+    print("\n=== Этап 3: Полный граф зависимостей (итеративный DFS) ===")
+
+    start = params["package_name"]
+    max_depth = int(params["max_depth"])
+    skip_substring = params.get("skip_substring", "")
+
+    adjacency = {}       # node -> list of neighbours
+    visited = set()      # уже полностью обработанные узлы
+    stack = []           # стек для DFS: элементы (имя_пакета, текущая_глубина)
+
+    stack.append((start, 0))
 
     while stack:
-        node, depth, state = stack.pop()
-        if state == 0:
-            if node in visited:
-                continue
-            if node in in_stack:
-                # цикл — не разворачиваем дальше
-                continue
-            in_stack.add(node)
-            order.append(node)
+        current, depth = stack.pop()
+        if current in visited:
+            continue
 
-            stack.append((node, depth, 1))
+        # фильтр по подстроке (если задан)
+        if skip_substring != "" and skip_substring in current:
+            # просто не разворачиваем такой узел
+            visited.add(current)
+            continue
 
-            try:
-                neigh = neighbors_func(node) if depth < max_depth else []
-            except KeyError:
-                neigh = []
-            adj.setdefault(node, [])
-            for nb in neigh:
-                adj[node].append(nb)
-                if nb not in visited:
-                    stack.append((nb, depth + 1, 0))
-        else:
-            in_stack.discard(node)
-            visited.add(node)
+        visited.add(current)
 
-    return adj, order
+        # получаем список соседей
+        neighbors = deps.get(current, [])
+        adjacency[current] = neighbors
 
+        # если достигли максимальной глубины, дальше не идём
+        if depth >= max_depth:
+            continue
 
-def make_filtered_neighbors(base_neighbors, skip_substring):
-    if not skip_substring:
-        return base_neighbors
-    def wrapper(node):
-        return [nb for nb in base_neighbors(node) if skip_substring not in nb]
-    return wrapper
+        # добавляем соседей в стек
+        for name in neighbors:
+            if name not in visited:
+                stack.append((name, depth + 1))
 
-
-# ---------- CLI‑поток ----------
-
-def stage1_print_params(p):
-    print("=== Этап 1: Параметры (ключ=значение) ===")
-    for k in ("package_name","repo_or_test_path","mode","version","max_depth"):
-        print(f"{k}={p[k]}")
-    print()
-
-
-def stage2_get_direct_deps(p):
-    print("=== Этап 2: Прямые зависимости ===")
-    pkg = p["package_name"]
-    if p["mode"] == "test":
-        graph = read_test_graph(p["repo_or_test_path"])
-        deps = graph.get(pkg, [])
-        print(f"{pkg}: {', '.join(deps) if deps else '(нет прямых зависимостей)'}")
-        return make_filtered_neighbors(lambda n: graph.get(n, []), p.get("skip_substring",""))
-    else:
-        apk_text = download_text(p["repo_or_test_path"])
-        db = parse_apkindex(apk_text)
-        deps = get_direct_deps_real(db, pkg, p["version"])
-        print(f"{pkg} ({p['version']}): {', '.join(deps) if deps else '(нет прямых зависимостей)'}")
-
-        def neigh(n):
-            if n == pkg:
-                return deps
-            versions = db.get(n, {})
-            if not versions:
-                raise KeyError(f"Пакет не найден в APKINDEX: {n}")
-            ver = sorted(versions.keys())[-1]  # простейший выбор версии
-            return versions[ver]
-        return make_filtered_neighbors(neigh, p.get("skip_substring",""))
-
-
-def stage3_build_graph(p, neighbors_func):
-    print("\n=== Этап 3: Полный граф (итеративный DFS, max_depth) ===")
-    max_depth = int(p["max_depth"])
-    start = p["package_name"]
-    adj, order = build_graph_iterative_dfs(start, max_depth, neighbors_func)
-
-    print(f"Порядок обхода: {', '.join(order)}")
+    # вывод результата
     print("Список смежности:")
-    for node in adj:
-        deps = adj[node]
-        print(f"  {node} -> {', '.join(deps) if deps else '∅'}")
+    for name in adjacency:
+        neigh = adjacency[name]
+        if len(neigh) == 0:
+            line = "∅"
+        else:
+            line = ", ".join(neigh)
+        print(f"  {name} -> {line}")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Использование: python main.py путь/к/config.csv")
+        print("Использование: python main.py config.csv")
         sys.exit(1)
-    cfg_path = sys.argv[1]
-    try:
-        params = read_csv_config(cfg_path)
-        validate_params(params)
-        stage1_print_params(params)               # Этап 1
-        neigh = stage2_get_direct_deps(params)    # Этап 2
-        stage3_build_graph(params, neigh)         # Этап 3
-    except Exception as e:
-        print(f"[ОШИБКА] {e}", file=sys.stderr)
-        sys.exit(2)
+
+    config_path = sys.argv[1]
+    params = read_config(config_path)
+    validate_config(params)
+    print_params(params)               # Этап 1
+    deps = stage2_get_direct_deps(params)  # Этап 2
+    stage3_build_graph(params, deps)   # Этап 3
 
 
 if __name__ == "__main__":
